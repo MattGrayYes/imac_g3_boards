@@ -23,14 +23,24 @@
 
    "BUFFER_LENGTH" in
    "arduino_install_folder/hardware/arduino/avr/libraries/Wire/src/Wire.h"
-
+   "/Users/mattg/Library/Arduino15/packages/arduino/hardware/avr/1.8.6/libraries/Wire/src/Wire.h"
+   
    and
 
    "TWI_BUFFER_LENGTH" in
    "arduino_install_folder/hardware/arduino/avr/libraries/Wire/src/utility/twi.h"
+   "/Users/mattg/Library/Arduino15/packages/arduino/hardware/avr/1.8.6/libraries/Wire/src/utility/twi.h"
 
    Both of these must be changed from 32 to 128 to be able to transmit
    the edid byte array in one shot.
+
+   Editing the libraries with an ifndef, this should let us define the new values here, rather than
+   change the library for every use.
+   
+   For example in Wire.h
+   #ifndef BUFFER_LENGTH
+   #define BUFFER_LENGTH 32
+   #endif
 
    To test this program, you can directly wire SDA(pin 12),SCL(pin 15)
    and GND(pin 6) pins from your computers VGA portbdirectly into the
@@ -45,24 +55,22 @@
   manager or from https://github.com/Testato/SoftwareWire
 */
 
+#define BUFFER_LENGTH 128
+#define TWI_BUFFER_LENGTH 128
+
 #include "ivad.h"
 #include "imacG3IvadInit.h"
 #include <EEPROMWearLevel.h>
 #include <SoftwareWire.h>
 #include <Wire.h>
 
+#if BUFFER_LENGTH < 128
+#error Must patch the Wire library to send EDID correctly.
+#endif
 
-//starting monitor property values.
-byte verticalPositionValueIndex = 0x4d;//77
-byte contrastValueIndex = 0xfe;
-byte horizontalPositionValueIndex = 0xb0;//176
-byte heightValueIndex = 0xf0;//240
-byte widthValueIndex = 0x19;//25
-byte brightnessValueIndex = 0x0a;
-byte parallelogramValueIndex = 0xc6;//198
-byte keystoneValueIndex = 0x9b;//155
-byte rotationValueIndex = 0x42;//66
-byte pincushionValueIndex = 0xcb;//203
+#if TWI_BUFFER_LENGTH < 128
+#error Must patch the TWI library to send EDID correctly.
+#endif
 
 byte SERIAL_BUFFER[SERIAL_BUFFER_MAX_SIZE];
 byte SERIAL_BUFFER_DATA_SIZE;
@@ -84,7 +92,6 @@ byte buttonState = LOW;
 //vsync pin
 byte vsyncPin = 10;
 
-
 //vsync power off countdown in seconds
 byte vsync_off_time = 180;
 
@@ -95,12 +102,9 @@ unsigned long currentTime = 0;
 unsigned long startTime = 0;
 unsigned long elapsedTime = 0;
 
-//The init sequence is sent on a software i2c bus.
+// The init sequence is sent on a software i2c bus.
 // sda is on 4 and scl is on 5
 SoftwareWire softWire( 4, 5);
-
-
-
 
 void setup() {
 
@@ -112,19 +116,24 @@ void setup() {
   pinMode(9, INPUT);//this pin is on the J5 connector for general use PB1.
 
   EEPROMwl.begin(CONFIG_EEPROM_VERSION, CONFIG_EEPROM_SLOTS + 1);
-  Wire.begin(0x50); //join as slave and wait for EDID requests
-  softWire.begin();// join as master and send init sequence
-  Serial.begin(115200);//use built in serial
+  Wire.begin(0x50);     //  VGA: join as slave and wait for EDID requests
+  softWire.begin();     // IVAD: join as master and send init sequence to IVAD board
+  Serial.begin(115200); // SELF: start built in serial to recieve commands & output status
   Serial.setTimeout(1000);
 
-  Wire.onRequest(requestEvent); //event handler for requests from master
-  Wire.onReceive(receiveData); // event handler when receiving from  master
+  Serial.println("");
+  Serial.println("Hello, Turning on!");
+
+  Wire.onRequest(requestEvent); // event handler for requests from master
+  Wire.onReceive(receiveData);  // event handler when receiving from  master
+  
   // turn it all off
   externalCircuitOff();
 
   //check to see if it's the 1st time running after burning firmware
   FIRST_RUN = EEPROMwl.read(CONFIG_EEPROM_SLOTS);
   if (FIRST_RUN != 0x79 ) {
+    Serial.println("First Run, configuring EEPROM");
     EEPROMwl.update(CONFIG_EEPROM_SLOTS, 0x79);
     settings_reset_default();
     settings_store();
@@ -153,34 +162,7 @@ void loop() {
     currentTime = millis();
     elapsedTime = currentTime - startTime;
 
-
     serial_processing();
-
-
-    //increment vsyncDetect everytime vsync is detected
-    if (pulseIn(vsyncPin, HIGH, 10000) > 0) {
-
-      if (vsyncDetect < vsync_off_time) {
-        vsyncDetect++;
-      }//end if
-      startTime = currentTime = millis();
-    }//end if
-
-
-    //decrement vsyncDetect whenever one second elapses
-    if (elapsedTime >= 1000 && vsyncDetect > 0) {
-      vsyncDetect--;
-      startTime = currentTime = millis();
-    }
-
-    //do stuff whn vsyncDetect is 0
-    if (vsyncDetect <= 0) {
-      startTime = 0;
-      currentTime = 0;
-       externalCircuitOff();
-
-
-    }
 
   }//end if
 
@@ -190,21 +172,16 @@ void loop() {
     if (buttonPressedTime <= 10) {
       buttonPressedTime++;
     }//end if
-
-
-
   }
   else
   {
     //buttonPressedTime = 0;
-
   }
 
   //turn everything off if button is pressed for 10 ms
   if (buttonPressedTime > 0 && externalCircuitState == HIGH && buttonState == HIGH) {
     externalCircuitOff();
     buttonPressedTime = 0;
-
   }
 
   //turn everything on if button is pressed for 10 ms
@@ -214,11 +191,7 @@ void loop() {
     startTime = millis();
     currentTime = millis();
     vsyncDetect = vsync_off_time;
-
   }
-
-
-
 
 }//end loop
 
@@ -226,29 +199,51 @@ void loop() {
 
 void handleSerial(char incoming) {
   /*
-     a = move left
-     s = move right
-     w = move up
-     z = move down
+                        ROTATE    PIN_CUSHION   PWR_OFF  PRINT_INFO
+     MOVE   SQUISH       t y         u i           o         p
+      w       r        
+     a s     d f         g h         j k
+      z       c        CONTRAST   BRIGHTNESS
+      
+            x   v        b n
+           PARALLEL    KEYSTONE           
+     
 
-     d = skinnier
-     f = fatter
-     r = taller
-     c = shorter
-
-     g = contrast down
-     h = contrast up
-
-     j = brightness down
-     k = brightness up
-
+    a = move left
+    s = move right
+    w = move up
+    z = move down
+    
+    d = skinnier
+    f = fatter
+    r = taller
+    c = shorter
+    
+    g = contrast down
+    h = contrast up
+    
+    j = brightness down
+    k = brightness up
+    
+    x = paralellogram left
+    v = paralellogram right
+    
+    b = keystone top
+    n = keystone bottom
+      
+    t = rotate left
+    y = rotate right
+    
+    u = pin cushion out
+    i = pin cushion in
 
   */
 
 
-  //if (Serial.available() > 0) {
-  // char incoming = Serial.read();
-
+  // Echo received text back to the sender.
+  Serial.print(incoming);
+  Serial.print(" ");
+  
   int index = -1;
   bool increment = true;
   switch (incoming) {
@@ -350,8 +345,10 @@ void handleSerial(char incoming) {
         externalCircuitOff();
       }//end if
       break;
+    default:
+      Serial.println("unknown command");
+      break;
   }
-  //}
 
   if (index > -1) {
     int val = CURRENT_CONFIG[index];
@@ -362,54 +359,33 @@ void handleSerial(char incoming) {
     {
       val--;
     }
-
+    
     ivad_change_setting(index, val);
+
+    char hexChar[2];
+    sprintf(hexChar, "%02X", val);
+    Serial.print(hexChar); //report changed value to user
+    Serial.println("");
   }//end if
-
-
+  else {
+    Serial.println("");
+  }
+  
 }//end handleSerial
 
 void printCurrentSettings() {
-  Serial.println(F("----------------------------"));
-
-  Serial.print(F("heightValueIndex: "));
-  Serial.println(heightValueIndex, HEX);
-
-  Serial.print(F("widthValueIndex: "));
-  Serial.println(widthValueIndex, HEX);
-
+  Serial.println("Serial commands for controlling the CRT Screen:");
   Serial.println("");
-
-  Serial.print(F("verticalPositionValueIndex: "));
-  Serial.println(verticalPositionValueIndex, HEX);
-
-  Serial.print(F("horizontalPositionValueIndex: "));
-  Serial.println(horizontalPositionValueIndex, HEX);
-
-  Serial.println(F(""));
-
-  Serial.print(F("rotationValueIndex: "));
-  Serial.println(rotationValueIndex, HEX);
-
-  Serial.print(F("parallelogramValueIndex: "));
-  Serial.println(parallelogramValueIndex, HEX);
-
-  Serial.print(F("keystoneValueIndex: "));
-  Serial.println(keystoneValueIndex, HEX);
-
-  Serial.print(F("pincushionValueIndex: "));
-  Serial.println(pincushionValueIndex, HEX);
-
+  Serial.println("                    ROTATE    PIN_CUSHION   PWR_OFF  PRINT_INFO");
+  Serial.println(" MOVE   SQUISH       t y         u i           o         p     ");
+  Serial.println("  w       r                                                    ");
+  Serial.println(" a s     d f         g h         j k                           ");
+  Serial.println("  z       c        CONTRAST   BRIGHTNESS                       ");
+  Serial.println("                                                               ");
+  Serial.println("        x   v        b n                                       ");
+  Serial.println("       PARALLEL    KEYSTONE                                    ");
   Serial.println("");
-
-  Serial.print(F("contrastValueIndex: "));
-  Serial.println(contrastValueIndex, HEX);
-
-  Serial.print(F("brightnessValueIndex: "));
-  Serial.println(brightnessValueIndex, HEX);
-
-  Serial.println(F("----------------------------"));
-
+  Serial.println("Code for displaying current settings does not exist.");
 }
 
 void writeToIvad(byte address, byte message) {
@@ -625,16 +601,15 @@ void externalCircuitOff() {
 void requestEvent() {
   //delay(500);
   Wire.write(edid, 128);
+  Serial.println("VGA I2C Request recieved, so sending EDID.");
+  printEDID();
 
-
-
+  Serial.println("");
 }//end method
 // function that executes whenever data is received by the slave
 
 
 void receiveData(byte byteCount) {
-
-
   while (Wire.available()) {
     data = Wire.read();
   }
@@ -656,7 +631,7 @@ void serial_processing()
   byte b ;
 
   if (Serial.available()) {
-
+    
     do
     {
       b = Serial.read();
@@ -807,6 +782,7 @@ int ivad_change_setting(const int ivad_setting,  const byte value)
 */
 void settings_load()
 {
+  Serial.println("loading settings from eeprom");
   // Set something so a checksum mismatch can trigger if there's nothing in the EEPROM.
 
   for (byte eeprom_memory_offset = 0 ; eeprom_memory_offset < CONFIG_EEPROM_SLOTS ; eeprom_memory_offset++) {
@@ -841,7 +817,7 @@ void ivad_write_settings()
 
 void settings_store()
 {
-
+  Serial.println("saving settings to eeprom");
   //compute current config checksum and store it.
   byte current_config_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
 
@@ -851,12 +827,12 @@ void settings_store()
     EEPROMwl.update(eeprom_memory_offset, CURRENT_CONFIG[eeprom_memory_offset]);
   }//end for
 
-
 }
 
 
 void settings_reset_default()
 {
+  Serial.println("resetting settings to default");
 
   //compute current config checksum and store it.
   byte current_config_checksum = checksum(CURRENT_CONFIG, CONFIG_EEPROM_SLOTS - 1);
@@ -867,6 +843,20 @@ void settings_reset_default()
     CURRENT_CONFIG[eeprom_memory_offset] = VIDEO_CONFIG_DEFAULT[eeprom_memory_offset];
   }//end for
 
+}
 
+void printEDID()
+{
+  Serial.println("*** EDID ***");
+  for(int i=0; i<sizeof(edid); i++){
+    printHexByte(edid[i]);
+  }
+  Serial.println("");
+}
 
+void printHexByte(uint8_t num) {
+  char hexChar[2];
+
+  sprintf(hexChar, "%02X", num);
+  Serial.print(hexChar);
 }
